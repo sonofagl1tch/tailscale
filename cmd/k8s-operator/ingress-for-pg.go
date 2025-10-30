@@ -1170,4 +1170,3 @@ func tagViolations(obj client.Object) []string {
 	}
 	return violations
 }
-
