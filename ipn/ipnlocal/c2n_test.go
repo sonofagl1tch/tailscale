@@ -185,7 +185,7 @@ func eachStructValue(v reflect.Value, cb func(reflect.Type, reflect.StructField,
 	}
 }
 
-// TestRedactNetmapPrivateKeys tests that redactNetmapPrivateKeys redacts all private keys
+// TestRedactNetmapPrivateKeys tests that [redactNetmapPrivateKeys] redacts all private keys
 // and other private fields from a netmap.NetworkMap, and only those fields.
 func TestRedactNetmapPrivateKeys(t *testing.T) {
 	type field struct {
@@ -211,6 +211,7 @@ func TestRedactNetmapPrivateKeys(t *testing.T) {
 		f(netmap.NetworkMap{}, "DisplayMessages"):          false,
 		f(netmap.NetworkMap{}, "Domain"):                   false,
 		f(netmap.NetworkMap{}, "DomainAuditLogID"):         false,
+		f(netmap.NetworkMap{}, "LogUploadAuth"):            false,
 		f(netmap.NetworkMap{}, "Expiry"):                   false,
 		f(netmap.NetworkMap{}, "MachineKey"):               false,
 		f(netmap.NetworkMap{}, "Name"):                     false,
