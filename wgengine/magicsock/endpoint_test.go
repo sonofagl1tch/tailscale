@@ -281,10 +281,10 @@ func Test_endpoint_maybeProbeUDPLifetimeLocked(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			c := &Conn{}
+			c.discoPublic.Store(tt.localDisco)
 			de := &endpoint{
-				c: &Conn{
-					discoPublic: tt.localDisco,
-				},
+				c:        c,
 				bestAddr: tt.bestAddr,
 			}
 			if tt.remoteDisco != nil {

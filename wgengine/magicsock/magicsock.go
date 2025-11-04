@@ -273,14 +273,20 @@ type Conn struct {
 	// channel operations and goroutine creation.
 	hasPeerRelayServers atomic.Bool
 
+	// rotateDiscoMu serializes disco key rotation mutations to prevent
+	// concurrent rotations from interfering with each other. It does not
+	// protect reads of the disco keys.
+	// Must only be taken for rotations.
+	rotateDiscoMu sync.Mutex
+
 	// discoPrivate is the private naclbox key used for active
-	// discovery traffic. It is always present, and immutable.
-	discoPrivate key.DiscoPrivate
-	// public of discoPrivate. It is always present and immutable.
-	discoPublic key.DiscoPublic
+	// discovery traffic. It is always present and can be rotated.
+	discoPrivate syncs.AtomicValue[key.DiscoPrivate]
+	// public of discoPrivate. It is always present and can be rotated.
+	discoPublic syncs.AtomicValue[key.DiscoPublic]
 	// ShortString of discoPublic (to save logging work later). It is always
-	// present and immutable.
-	discoShort string
+	// present and can be rotated.
+	discoShort syncs.AtomicValue[string]
 
 	// ============================================================
 	// mu guards all following fields; see userspaceEngine lock
@@ -596,6 +602,7 @@ type UDPRelayAllocResp struct {
 // of NewConn. Mostly for tests.
 func newConn(logf logger.Logf) *Conn {
 	discoPrivate := key.NewDisco()
+	discoPublic := discoPrivate.Public()
 	c := &Conn{
 		logf:         logf,
 		derpRecvCh:   make(chan derpReadResult, 1), // must be buffered, see issue 3736
@@ -603,11 +610,11 @@ func newConn(logf logger.Logf) *Conn {
 		peerLastDerp: make(map[key.NodePublic]int),
 		peerMap:      newPeerMap(),
 		discoInfo:    make(map[key.DiscoPublic]*discoInfo),
-		discoPrivate: discoPrivate,
-		discoPublic:  discoPrivate.Public(),
 		cloudInfo:    newCloudInfo(logf),
 	}
-	c.discoShort = c.discoPublic.ShortString()
+	c.discoPrivate.Store(discoPrivate)
+	c.discoPublic.Store(discoPublic)
+	c.discoShort.Store(discoPublic.ShortString())
 	c.bind = &connBind{Conn: c, closed: true}
 	c.receiveBatchPool = sync.Pool{New: func() any {
 		msgs := make([]ipv6.Message, c.bind.BatchSize())
@@ -635,7 +642,7 @@ func (c *Conn) onUDPRelayAllocResp(allocResp UDPRelayAllocResp) {
 		// now versus taking a network round-trip through DERP.
 		selfNodeKey := c.publicKeyAtomic.Load()
 		if selfNodeKey.Compare(allocResp.ReqRxFromNodeKey) == 0 &&
-			allocResp.ReqRxFromDiscoKey.Compare(c.discoPublic) == 0 {
+			allocResp.ReqRxFromDiscoKey.Compare(c.discoPublic.Load()) == 0 {
 			c.relayManager.handleRxDiscoMsg(c, allocResp.Message, selfNodeKey, allocResp.ReqRxFromDiscoKey, epAddr{})
 			metricLocalDiscoAllocUDPRelayEndpointResponse.Add(1)
 		}
@@ -760,7 +767,7 @@ func NewConn(opts Options) (*Conn, error) {
 		c.logf("[v1] couldn't create raw v6 disco listener, using regular listener instead: %v", err)
 	}
 
-	c.logf("magicsock: disco key = %v", c.discoShort)
+	c.logf("magicsock: disco key = %v", c.discoShort.Load())
 	return c, nil
 }
 
@@ -1239,7 +1246,38 @@ func (c *Conn) GetEndpointChanges(peer tailcfg.NodeView) ([]EndpointChange, erro
 
 // DiscoPublicKey returns the discovery public key.
 func (c *Conn) DiscoPublicKey() key.DiscoPublic {
-	return c.discoPublic
+	return c.discoPublic.Load()
+}
+
+// RotateDiscoKey generates a new discovery key pair and updates the connection
+// to use it. This invalidates all existing disco sessions and will cause peers
+// to re-establish discovery sessions with the new key.
+//
+// This method is primarily intended for testing and debugging.
+//
+// Rotations are serialized to ensure only one rotation happens at a time.
+func (c *Conn) RotateDiscoKey() {
+	c.rotateDiscoMu.Lock()
+	defer c.rotateDiscoMu.Unlock()
+
+	oldShort := c.discoShort.Load()
+	newPrivate := key.NewDisco()
+	newPublic := newPrivate.Public()
+	newShort := newPublic.ShortString()
+
+	c.discoPrivate.Store(newPrivate)
+	c.discoPublic.Store(newPublic)
+	c.discoShort.Store(newShort)
+
+	c.logf("magicsock: rotated disco key from %v to %v", oldShort, newShort)
+
+	c.mu.Lock()
+	c.discoInfo = make(map[key.DiscoPublic]*discoInfo)
+	c.mu.Unlock()
+
+	if c.connCtx != nil {
+		c.ReSTUN("disco-key-rotation")
+	}
 }
 
 // determineEndpoints returns the machine's endpoint addresses. It does a STUN
@@ -1909,7 +1947,7 @@ func (c *Conn) sendDiscoAllocateUDPRelayEndpointRequest(dst epAddr, dstKey key.N
 	if isDERP && dstKey.Compare(selfNodeKey) == 0 {
 		c.allocRelayEndpointPub.Publish(UDPRelayAllocReq{
 			RxFromNodeKey:  selfNodeKey,
-			RxFromDiscoKey: c.discoPublic,
+			RxFromDiscoKey: c.discoPublic.Load(),
 			Message:        allocReq,
 		})
 		metricLocalDiscoAllocUDPRelayEndpointRequest.Add(1)
@@ -1980,7 +2018,7 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 		}
 	}
 	pkt = append(pkt, disco.Magic...)
-	pkt = c.discoPublic.AppendTo(pkt)
+	pkt = c.discoPublic.Load().AppendTo(pkt)
 
 	if isDERP {
 		metricSendDiscoDERP.Add(1)
@@ -1998,7 +2036,7 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 			if !dstKey.IsZero() {
 				node = dstKey.ShortString()
 			}
-			c.dlogf("[v1] magicsock: disco: %v->%v (%v, %v) sent %v len %v\n", c.discoShort, dstDisco.ShortString(), node, derpStr(dst.String()), disco.MessageSummary(m), len(pkt))
+			c.dlogf("[v1] magicsock: disco: %v->%v (%v, %v) sent %v len %v\n", c.discoShort.Load(), dstDisco.ShortString(), node, derpStr(dst.String()), disco.MessageSummary(m), len(pkt))
 		}
 		if isDERP {
 			metricSentDiscoDERP.Add(1)
@@ -2347,13 +2385,13 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		}
 		if isVia {
 			c.dlogf("[v1] magicsock: disco: %v<-%v via %v (%v, %v)  got call-me-maybe-via, %d endpoints",
-				c.discoShort, epDisco.short, via.ServerDisco.ShortString(),
+				c.discoShort.Load(), epDisco.short, via.ServerDisco.ShortString(),
 				ep.publicKey.ShortString(), derpStr(src.String()),
 				len(via.AddrPorts))
 			c.relayManager.handleCallMeMaybeVia(ep, lastBest, lastBestIsTrusted, via)
 		} else {
 			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got call-me-maybe, %d endpoints",
-				c.discoShort, epDisco.short,
+				c.discoShort.Load(), epDisco.short,
 				ep.publicKey.ShortString(), derpStr(src.String()),
 				len(cmm.MyNumber))
 			go ep.handleCallMeMaybe(cmm)
@@ -2399,7 +2437,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 
 		if isResp {
 			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v) got %s, %d endpoints",
-				c.discoShort, epDisco.short,
+				c.discoShort.Load(), epDisco.short,
 				ep.publicKey.ShortString(), derpStr(src.String()),
 				msgType,
 				len(resp.AddrPorts))
@@ -2413,7 +2451,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 			return
 		} else {
 			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v) got %s disco[0]=%v disco[1]=%v",
-				c.discoShort, epDisco.short,
+				c.discoShort.Load(), epDisco.short,
 				ep.publicKey.ShortString(), derpStr(src.String()),
 				msgType,
 				req.ClientDisco[0].ShortString(), req.ClientDisco[1].ShortString())
@@ -2575,7 +2613,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 		if numNodes > 1 {
 			pingNodeSrcStr = "[one-of-multi]"
 		}
-		c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got ping tx=%x padding=%v", c.discoShort, di.discoShort, pingNodeSrcStr, src, dm.TxID[:6], dm.Padding)
+		c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got ping tx=%x padding=%v", c.discoShort.Load(), di.discoShort, pingNodeSrcStr, src, dm.TxID[:6], dm.Padding)
 	}
 
 	ipDst := src
@@ -2648,7 +2686,7 @@ func (c *Conn) discoInfoForKnownPeerLocked(k key.DiscoPublic) *discoInfo {
 		di = &discoInfo{
 			discoKey:   k,
 			discoShort: k.ShortString(),
-			sharedKey:  c.discoPrivate.Shared(k),
+			sharedKey:  c.discoPrivate.Load().Shared(k),
 		}
 		c.discoInfo[k] = di
 	}
