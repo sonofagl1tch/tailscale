@@ -1,0 +1,9 @@
+tailscale (1.25.0-1) unstable; urgency=medium
+
+  * Fix DNS resolution issues on Ubuntu 22.04
+  * Improve connection stability for mobile clients
+  * Add support for custom DERP servers
+  * Update WireGuard to latest version
+  * Fix memory leak in netstack implementation
+
+ -- Tailscale Inc <info@tailscale.com>  Mon, 15 Jan 2024 10:30:00 +0000

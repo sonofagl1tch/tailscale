@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/goreleaser/nfpm/v2"
@@ -109,6 +111,18 @@ func main() {
 		info.Overridables.Conflicts = []string{*replaces}
 	}
 
+	// Generate changelog for deb packages
+	if *pkgType == "deb" {
+		changelogPath := generateChangelog(*version)
+		if changelogPath != "" {
+			contents = append(contents, &files.Content{
+				Type: files.TypeFile,
+				Source: changelogPath,
+				Destination: "/usr/share/doc/tailscale/changelog.Debian.gz",
+			})
+		}
+	}
+
 	switch *pkgType {
 	case "deb":
 		info.Section = "net"
@@ -131,4 +145,31 @@ func main() {
 	if err := pkg.Package(info, f); err != nil {
 		log.Fatalf("Creating package %q: %v", *out, err)
 	}
+}
+
+func generateChangelog(version string) string {
+	cmd := exec.Command("go", "run", "./cmd/mkchangelog", version)
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	
+	tmpFile := filepath.Join(os.TempDir(), "changelog")
+	if err := os.WriteFile(tmpFile, output, 0644); err != nil {
+		return ""
+	}
+	
+	// Compress the changelog
+	gzipCmd := exec.Command("gzip", "-c", tmpFile)
+	gzOutput, err := gzipCmd.Output()
+	if err != nil {
+		return ""
+	}
+	
+	gzFile := tmpFile + ".gz"
+	if err := os.WriteFile(gzFile, gzOutput, 0644); err != nil {
+		return ""
+	}
+	
+	return gzFile
 }
