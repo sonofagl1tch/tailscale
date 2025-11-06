@@ -81,6 +81,28 @@ func main() {
 	if err != nil {
 		log.Fatalf("Building package contents: %v", err)
 	}
+	if len(*depends) != 0 {
+		info.Overridables.Depends = strings.Split(*depends, ",")
+	}
+	if len(*recommends) != 0 {
+		info.Overridables.Recommends = strings.Split(*recommends, ",")
+	}
+	if *replaces != "" {
+		info.Overridables.Replaces = []string{*replaces}
+		info.Overridables.Conflicts = []string{*replaces}
+	}
+	// Generate changelog for deb packages
+	if *pkgType == "deb" {
+		changelogPath := generateChangelog(*version)
+		if changelogPath != "" {
+			contents = append(contents, &files.Content{
+				Type: files.TypeFile,
+				Source: changelogPath,
+				Destination: "/usr/share/doc/tailscale/changelog.Debian.gz",
+			})
+		}
+	}
+
 	info := nfpm.WithDefaults(&nfpm.Info{
 		Name:        *name,
 		Arch:        *goarch,
@@ -100,28 +122,9 @@ func main() {
 		},
 	})
 
-	if len(*depends) != 0 {
-		info.Overridables.Depends = strings.Split(*depends, ",")
-	}
-	if len(*recommends) != 0 {
-		info.Overridables.Recommends = strings.Split(*recommends, ",")
-	}
-	if *replaces != "" {
-		info.Overridables.Replaces = []string{*replaces}
-		info.Overridables.Conflicts = []string{*replaces}
-	}
+	
 
-	// Generate changelog for deb packages
-	if *pkgType == "deb" {
-		changelogPath := generateChangelog(*version)
-		if changelogPath != "" {
-			contents = append(contents, &files.Content{
-				Type: files.TypeFile,
-				Source: changelogPath,
-				Destination: "/usr/share/doc/tailscale/changelog.Debian.gz",
-			})
-		}
-	}
+
 
 	switch *pkgType {
 	case "deb":
